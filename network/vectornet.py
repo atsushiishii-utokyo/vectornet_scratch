@@ -93,7 +93,7 @@ class VectorNet(nn.Module):
             num_global_heads: number of heads for the global graph.
         """
         super().__init__()
-        self.polyline_graph = PolylineSubGraph(
+        self.polyline_sub_graph = PolylineSubGraph(
             num_subgraph_layers=num_subgraph_layers,
             num_features=num_features
         )
@@ -123,7 +123,7 @@ class VectorNet(nn.Module):
             output (torch.Tensor): Trajectory Prediction
         """
         # Process each polyline through the subgraph
-        polyline_features = self.polyline_graph(polylines_list)
+        polyline_features = self.polyline_sub_graph(polylines_list)
         
         # Process through global graph
         global_features = self.global_graph(polyline_features)
@@ -150,48 +150,33 @@ class PolylineSubGraph(nn.Module):
         # Create a list of PolylineSubGraphLayer for each layer
         # The input dimension of the i-th layer is num_features * (2**i)
         # In each layer, it computes
-        # [batch_size, num_polylines, num_vectors, num_features * (2**i)] -> 
-        # [batch_size, num_polylines, num_vectors, num_features * (2**(i+1))]
+        #   [batch_size, num_vectors, num_features * (2**i)] -> 
+        #   [batch_size, num_vectors, num_features * (2**(i+1))]
         self.polyline_subgraph_layers = nn.ModuleList([
             PolylineSubGraphLayer(num_features*(2**i)) for i in range(num_subgraph_layers)
         ])
         
-    def forward(self, polylines_list: list[torch.Tensor]) -> list[torch.Tensor]:
+    def forward(self, polyline: torch.Tensor) -> torch.Tensor:
         """
         Forward the inputs of PolylineSubGraph and output the features of each polyline.
 
         Args:
-            polylines_list: List of polylines in the history as inputs.
-                [[num_vectors (num_past_steps), num_features] * num_polylines]
-                num_polylines is the number of agents + Map related polylines in the scene.
+            polyline: Polyline, input of SubGraph layer.
+                [batch_size, num_vectors (num_past_steps), num_features]
                 Inputs should be encoded to the vectors in advance to be used in the Graph Neural Network.
 
         Returns:
-            polyline_features_list: Features of each polyline.
-                [[batch_size, num_features * (2**num_subgraph_layers)]*num_polylines]
+            polyline_features: Features of each polyline.
+                [batch_size, num_features * (2**num_subgraph_layers)]
         """
-        batch_size = polylines_list[0].shape[0]
-        num_polylines = len(polylines_list)
-        
-        # 1. Encode nodes
-        node_features_list = [self.node_encoder(polylines) for polylines in polylines_list]
-        
-        # Create edge features
-        edge_features = torch.cat([
-            polylines.unsqueeze(3).expand(-1, -1, -1, num_nodes, -1),
-            polylines.unsqueeze(2).expand(-1, -1, num_nodes, -1, -1)
-        ], dim=-1)
-        
-        # Process through node processor
-        node_features = self.node_processor(node_features)
-        
-        # Apply masks
-        node_features = node_features * masks.unsqueeze(-1)
-        
-        # Aggregate node features to get polyline features
-        polyline_features = node_features.sum(dim=2) / (masks.sum(dim=2, keepdim=True) + 1e-6)
+        # 1. Process each polyline through the subgraph layers
+        polyline_features = polyline
+        for layer in self.polyline_subgraph_layers: 
+            # [batch_size, num_vectors, input_dim] -> [batch_size, num_vectors, input_dim*2]
+            polyline_features = layer(polyline_features)
         
         return polyline_features
+
 
 class PolylineSubGraphLayer(nn.Module):
     """
@@ -215,25 +200,41 @@ class PolylineSubGraphLayer(nn.Module):
             input_dim: input dimension of the local graph.
         """
         super().__init__()
+        self.input_dim = input_dim
         self.node_encoder = MLP(input_dim, input_dim)
-        self.edge_encoder = nn.Linear(input_dim * 2, hidden_dim)
+        self.edge_encoder = nn.Linear(input_dim * 2, input_dim * 2)
         self.node_processor = nn.Sequential(
-            nn.Linear(hidden_dim, hidden_dim),
+            nn.Linear(input_dim * 2, input_dim * 2),
             nn.ReLU(),
-            nn.Linear(hidden_dim, hidden_dim)
+            nn.Linear(input_dim * 2, input_dim * 2)
         )
 
     def forward(self, x: torch.Tensor):
         """
-        x (torch.Tensor): A set of vectors, input of SubGraph layer
-            [batch_size, n, input_dim]
-        Returns:
-            x (torch.Tensor): Processed features of each vector
-                [batch_size, n, hidden_dim]
-        """
-        x = self.node_encoder(x)
-        # Concat wit the max pooling
+        Forward the inputs of PolylineSubGraphLayer and output the features of each vector.
 
+        Args:
+            x: Polyline, input of SubGraph layer.
+                [batch_size, num_vectors, input_dim]
+            input_dim is variable depending on the layer.
+            First layer: input_dim = num_features
+            Second layer: input_dim = num_features * 2
+            Third layer: input_dim = num_features * 4
+            ...
+            Last layer: input_dim = num_features * (2**(num_subgraph_layers-1))
+
+        Returns:
+            x: Processed features of each vector
+                [batch_size, num_vectors, input_dim*2]
+        """
+        # [batch_size, num_vectors, input_dim] -> [batch_size, num_vectors, input_dim]
+        x = self.node_encoder(x)
+        # Concat with the max pooling
+        x = torch.cat([x, x.max(dim=1)[0].unsqueeze(1)], dim=-1)
+        # [batch_size, num_vectors, input_dim*2] -> [batch_size, num_vectors, input_dim*2]
+        x = self.edge_encoder(x)
+        # [batch_size, num_vectors, input_dim*2] -> [batch_size, num_vectors, input_dim*2]
+        x = self.node_processor(x)
         return x
 
 class GlobalGraph(nn.Module):
