@@ -60,7 +60,7 @@ class VectorNet_prediction(nn.Module):
             output (torch.Tensor): Trajectory Prediction
         """
         # [[num_vectors, num_features] * num_polylines] -> [batch_size, graph_output_dim]
-        output = self.vectornet(polylines_list)
+        output = self.vectornet(polylines_list, target_index)
         # [batch_size, graph_output_dim] -> [batch_size, num_prediction_features * num_future_steps]
         output = self.traj_decoder(output)
         return output
@@ -106,6 +106,7 @@ class VectorNet(nn.Module):
     def forward(
         self,
         polylines_list: list[torch.Tensor],
+        target_index: torch.Tensor,
         polyline_masks: Optional[torch.Tensor] = None,
     ) -> torch.Tensor:
         """
@@ -114,19 +115,37 @@ class VectorNet(nn.Module):
         # [[num_vectors, num_features] * num_polylines] -> [batch_size, graph_output_dim]
 
         Args:
-            polylines_list: Subset of polylinses; P = [P1, P2,...,Pn]}
-                Each P (Polyline) is expressed by subset of vectors Pi = {v0, v1, ...vp}
-                where the shape of Pi is [num_vectors, num_features]
+            polylines_list: List of polylines in the history as inputs.
+                [[num_vectors (num_past_steps), num_features] * num_polylines]
+                num_polylines is the number of agents + Map related polylines in the scene.
+                Inputs should be encoded to the vectors in advance to be used in the Graph Neural Network.
+
+            target_index: Index of the target agent to be predicted, mapping to the batch index.
+                [batch_size]
+                (ex) target_index = [0, 1, 2, 3, 4, 5, 6, 7, 8, 9,...15] if batch_size = 16. 
+                Since VectorNet could only predict trajectory of one agent at a time,
+                we need to specify the index of the target agent to be predicted.
+                This index is used to select the correct output from the VectorNet.
+                Batch processing allows us to predict trajectories of multiple agents at once.
 
             polyline_masks: Mask for the polylines for the graph completion task.
         Returns:
             output (torch.Tensor): Trajectory Prediction
         """
         # Process each polyline through the subgraph
-        polyline_features = self.polyline_sub_graph(polylines_list)
+        self.batch_size = target_index.shape[0]
+        polyline_features_list = []
+        for polyline in polylines_list:
+            # [num_vectors, num_features] -> [batch_size, num_vectors, num_features]
+            polyline = polyline.unsqueeze(0).repeat(self.batch_size, 1, 1)
+            # [batch_size, num_vectors, num_features] -> [batch_size, num_vectors, num_features]
+            # Convert to the target agent centric coordinates
+            polyline = polyline - polyline[target_index]
+            polyline_features = self.polyline_sub_graph(polyline)
+            polyline_features_list.append(polyline_features)
         
         # Process through global graph
-        global_features = self.global_graph(polyline_features)
+        global_features = self.global_graph(polyline_features_list, target_index)
         
         # Decode to output
         output = self.decoder(global_features)
@@ -209,7 +228,7 @@ class PolylineSubGraphLayer(nn.Module):
             nn.Linear(input_dim * 2, input_dim * 2)
         )
 
-    def forward(self, x: torch.Tensor):
+    def forward(self, x: torch.Tensor)->torch.Tensor:
         """
         Forward the inputs of PolylineSubGraphLayer and output the features of each vector.
 
@@ -247,23 +266,31 @@ class GlobalGraph(nn.Module):
             nn.Linear(hidden_dim, hidden_dim)
         )
         
-    def forward(self, polyline_features: torch.Tensor) -> torch.Tensor:
+    def forward(self, polyline_features_list: list[torch.Tensor], target_index: torch.Tensor) -> torch.Tensor:
         """Process polyline features through global attention and MLP layers.
         
         Args:
-            polyline_features (torch.Tensor): Input tensor containing polyline features
-                Shape: [batch_size, num_polylines, hidden_dim]
+            polyline_features_list: List of polyline features
+                [[batch_size, num_vectors, hidden_dim] * num_polylines]
+            target_index: Index of the target agent to be predicted, mapping to the batch index.
+                [batch_size]
+                (ex) target_index = [0, 1, 2, 3, 4, 5, 6, 7, 8, 9,...15] if batch_size = 16. 
+                Since VectorNet could only predict trajectory of one agent at a time,
+                we need to specify the index of the target agent to be predicted.
+                This index is used to select the correct output from the VectorNet.
                 
         Returns:
-            torch.Tensor: Processed global features after attention and MLP
-                Shape: [batch_size, num_polylines, hidden_dim]
+            global_features: Processed global features after attention and MLP
+                [batch_size, num_polylines, hidden_dim]
         """
         # polyline_features: [batch_size, num_polylines, hidden_dim]
         
         # Reshape for attention
-        batch_size, num_polylines, hidden_dim = polyline_features.shape
+        batch_size, num_polylines, hidden_dim = polyline_features_list[0].shape
+        polyline_features = torch.cat(polyline_features_list, dim=1)
+        # [batch_size, num_polylines, hidden_dim] -> [batch_size * num_polylines, 1, hidden_dim]
         polyline_features = polyline_features.reshape(batch_size * num_polylines, 1, hidden_dim)
-        
+        # [batch_size * num_polylines, 1, hidden_dim] -> [batch_size * num_polylines, 1, hidden_dim]
         # Apply attention
         attended_features, _ = self.attention(polyline_features, polyline_features, polyline_features)
         
