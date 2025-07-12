@@ -11,13 +11,15 @@ class VectorNet_prediction(nn.Module):
     
     MLP is used to decode the output of the VectorNet to the prediction output.
     [batch_size, num_features * (2**num_subgraph_layers)] -> 
-    [batch_size, num_prediction_features * num_future_steps]
+    [batch_size, num_future_steps, num_prediction_features]
 
     Args:
         config: Configuration for the VectorNet.
     """
     def __init__(self, config: dict[str, int]) -> None:
         super().__init__()
+        self.num_future_steps = config["num_future_steps"]
+        self.num_prediction_features = config["num_prediction_features"]
         self.vectornet = VectorNet(
             num_vectors=config["num_vectors"],
             num_features=config["num_features"],
@@ -26,8 +28,8 @@ class VectorNet_prediction(nn.Module):
             num_global_heads=config["num_global_heads"],
         )
         self.traj_decoder = MLP(
-            input_size=self.vectornet.graph_output_dim,
-            output_size=config["num_prediction_features"]*config["num_future_steps"]
+            input_size=self.vectornet.global_graph_input_output_dim,
+            output_size=self.num_future_steps*self.num_prediction_features
         )
     def forward(self, 
         polylines_list: list[torch.Tensor],
@@ -57,12 +59,15 @@ class VectorNet_prediction(nn.Module):
                 TODO: Implement the code to convert the polylines to the target agent centric coordinates.
 
         Returns:
-            output (torch.Tensor): Trajectory Prediction
+            output: Trajectory Prediction for each given track id
+                [batch_size, num_future_steps, num_prediction_features]
         """
         # [[num_vectors, num_features] * num_polylines] -> [batch_size, graph_output_dim]
         output = self.vectornet(polylines_list, target_index)
         # [batch_size, graph_output_dim] -> [batch_size, num_prediction_features * num_future_steps]
         output = self.traj_decoder(output)
+        # reshape the output
+        output = output.view(-1, self.num_future_steps, self.num_prediction_features)
 
         return output
 
@@ -322,13 +327,9 @@ class GlobalGraph(nn.Module):
         """
         super().__init__()
         # self.attention = nn.MultiheadAttention(num_global_layers, num_global_heads)
-        for _ in range(num_global_layers):
-            self.attention = nn.MultiheadAttention(embed_dim=emb_dim, num_heads=num_global_heads)
-            self.decoder = nn.Sequential(
-                nn.Linear(emb_dim, emb_dim),
-                nn.ReLU(),
-                nn.Linear(emb_dim, emb_dim)
-            )
+        self.global_graph = nn.ModuleList([
+            GlobalGraphLayer(embed_dim=emb_dim, num_heads=num_global_heads) for i in range(num_global_layers)
+        ])
         
     def forward(self, 
         polyline_features: torch.Tensor,
@@ -338,7 +339,7 @@ class GlobalGraph(nn.Module):
         
         Args:
             polyline_features: Polyline features after the subgraph.
-                [batch_size, num_polylines, num_global_graph_input_output_dim]
+                [batch_size, num_polylines, num_global_graph_input_output_dim (=emb_dim)]
                 NOTE: num_global_graph_input_output_dim = num_features * (2**num_subgraph_layers)
 
             target_index: Index of the target agent to be predicted, mapping to the batch index.
@@ -363,11 +364,12 @@ class GlobalGraph(nn.Module):
         return global_features
 
 class GlobalGraphLayer(nn.Module):
-    def __init__(self, emb_dim: int) -> None:
+    def __init__(self, embed_dim: int, num_heads: int) -> None:
         super().__init__()
-        self.attention = nn.MultiheadAttention(embed_dim=emb_dim, num_heads=num_global_heads)
+        self.attention = nn.MultiheadAttention(embed_dim=embed_dim, num_heads=num_heads)
         self.decoder = nn.Sequential(
-            nn.Linear(emb_dim, emb_dim),
+            nn.Linear(embed_dim, embed_dim),
             nn.ReLU(),
-            nn.Linear(emb_dim, emb_dim)
+            nn.Linear(embed_dim, embed_dim)
         )
+    def forward():
