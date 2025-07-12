@@ -60,14 +60,15 @@ class VectorNet_prediction(nn.Module):
             output (torch.Tensor): Trajectory Prediction
         """
         # [[num_vectors, num_features] * num_polylines] -> [batch_size, graph_output_dim]
-        output = self.vectornet(polylines_list)
+        output = self.vectornet(polylines_list, target_index)
         # [batch_size, graph_output_dim] -> [batch_size, num_prediction_features * num_future_steps]
         output = self.traj_decoder(output)
+
         return output
 
 class VectorNet(nn.Module):
     """
-    VectorNet Class for the agents trajectories prediction
+    VectorNet Class for the agents trajectories prediction.
     """
     def __init__(
         self,
@@ -78,7 +79,8 @@ class VectorNet(nn.Module):
         num_global_heads: int,
     ) -> None:
         """
-        Instantiate the VectorNet
+        Instantiate the VectorNet.
+
         Construct Polyline Subgraph (Local graph),
         Global Graph, and Decoder.
 
@@ -90,47 +92,90 @@ class VectorNet(nn.Module):
                 corresponds to the size of the last dimension of the local graph.
             num_subgraph_layers: number of layers for the polyline subgraph.
             num_global_layers: number of layers for the global graph.
-            num_global_heads: number of heads for the global graph.
+            num_global_heads: number of attention heads for the global graph.
         """
         super().__init__()
+        # Compute the output dimension of Global graph 
+        # using the number of features and the number of layers in the PolylneSubGraph
+        self.global_graph_input_output_dim = num_features * (2**num_subgraph_layers)
         self.polyline_sub_graph = PolylineSubGraph(
             num_subgraph_layers=num_subgraph_layers,
             num_features=num_features
         )
-        self.global_graph = GlobalGraph(hidden_dim, hidden_dim)
-        # Compute the output dimension of Global graph 
-        # using the number of features and the number of layers in the PolylneSubGraph
-        self.graph_output_dim = num_features * (2**num_subgraph_layers)
-        self.decoder = nn.Linear(hidden_dim, output_dim)
+        self.global_graph = GlobalGraph(
+            num_global_layers=num_global_layers,
+            num_global_heads=num_global_heads,
+            emb_dim=self.global_graph_input_output_dim,
+        )
         
     def forward(
         self,
         polylines_list: list[torch.Tensor],
+        target_index: torch.Tensor,
         polyline_masks: Optional[torch.Tensor] = None,
     ) -> torch.Tensor:
         """
         Forward the inputs of VectorNet and output the prediction.
+
+        (1) Process each polyline through the subgraph.
+        This returns the features of each polyline with the shape of 
+        [batch_size, num_features * (2**num_subgraph_layers)].
+        
+        (2) Stack the features of each polyline to form a global graph with the shape of 
+        [batch_size, num_polylines, num_features * (2**num_subgraph_layers)].
+
+        (3) Process through global graph.
+        This returns the features of each target agent with the shape of
+        [batch_size, global_graph_input_output_dim].
+
         Except for the prediction inference, mask out the node arbitarily for the graph completion task.
-        # [[num_vectors, num_features] * num_polylines] -> [batch_size, graph_output_dim]
 
         Args:
-            polylines_list: Subset of polylinses; P = [P1, P2,...,Pn]}
-                Each P (Polyline) is expressed by subset of vectors Pi = {v0, v1, ...vp}
-                where the shape of Pi is [num_vectors, num_features]
+            polylines_list: List of polylines in the history as inputs.
+                [[num_vectors (num_past_steps), num_features] * num_polylines]
+                num_polylines is the number of agents + Map related polylines in the scene.
+                Inputs should be encoded to the vectors in advance to be used in the Graph Neural Network.
 
-            polyline_masks: Mask for the polylines for the graph completion task.
+            target_index: Index of the target agent to be predicted, mapping to the batch index.
+                [batch_size]
+                (ex) target_index = [0, 1, 2, 3, 4, 5, 6, 7, 8, 9,...15] if batch_size = 16. 
+                Since VectorNet could only predict trajectory of one agent at a time,
+                we need to specify the index of the target agent to be predicted.
+                This index is used to select the correct output from the VectorNet.
+                Batch processing allows us to predict trajectories of multiple agents at once.
+
+            polyline_masks (Optional): Mask for the polylines for the graph completion task.
         Returns:
-            output (torch.Tensor): Trajectory Prediction
+            output: Global features of each target agent
+                [batch_size, global_graph_input_output_dim]
+                Note that global_graph_input_output_dim = num_features * (2**num_subgraph_layers),
+                same as the output dimension of the PolylineSubGraph and input dimension of the GlobalGraph.
         """
+        # (1) Process each polyline through the subgraph
+        self.batch_size = target_index.shape[0]
+        polyline_features_list = []
         # Process each polyline through the subgraph
-        polyline_features = self.polyline_sub_graph(polylines_list)
+        for polyline in polylines_list:
+            # [num_vectors, num_features] -> [batch_size, num_vectors, num_features]
+            polyline = polyline.unsqueeze(0).repeat(self.batch_size, 1, 1)
+            # [batch_size, num_vectors, num_features] -> [batch_size, num_vectors, num_features]
+            # Convert to the target agent centric coordinates
+            polyline = polyline - polyline[target_index]
+            polyline_features = self.polyline_sub_graph(polyline)
+            polyline_features_list.append(polyline_features)
         
-        # Process through global graph
-        global_features = self.global_graph(polyline_features)
+        # (2) Stack the features of each polyline
+        # [batch_size, num_features * (2**num_subgraph_layers)] * num_polylines
+        polyline_sub_graph_features = torch.stack(polyline_features_list, dim=1)
+        assert polyline_sub_graph_features.shape == (self.batch_size, len(polylines_list), self.global_graph_input_output_dim)
+
+        # (3) Process through global graph
+        global_features = self.global_graph(
+            polyline_features=polyline_sub_graph_features,
+            target_index=target_index,
+        )
         
-        # Decode to output
-        output = self.decoder(global_features)
-        return output
+        return global_features
 
 class PolylineSubGraph(nn.Module):
     def __init__(self, num_subgraph_layers: int, num_features: int) -> None:
@@ -159,6 +204,13 @@ class PolylineSubGraph(nn.Module):
     def forward(self, polyline: torch.Tensor) -> torch.Tensor:
         """
         Forward the inputs of PolylineSubGraph and output the features of each polyline.
+        First, process each polyline through the subgraph layers.
+        This returns the features of each vector in the polyline 
+        with the shape of [batch_size, num_vectors, num_features * (2**num_subgraph_layers)].
+
+        Then, aggregate the features of each polyline using max pooling.
+        This returns the features of each polyline with the shape of 
+        [batch_size, num_features * (2**num_subgraph_layers)].
 
         Args:
             polyline: Polyline, input of SubGraph layer.
@@ -171,10 +223,27 @@ class PolylineSubGraph(nn.Module):
         """
         # 1. Process each polyline through the subgraph layers
         polyline_features = polyline
+        batch_size, num_vectors, _ = polyline_features.shape
         for layer in self.polyline_subgraph_layers: 
+            # In each layer, the input dimension is num_features * (2**i)
+            # The output dimension is num_features * (2**(i+1))
             # [batch_size, num_vectors, input_dim] -> [batch_size, num_vectors, input_dim*2]
             polyline_features = layer(polyline_features)
-        
+        # 2. Aggregate the features of each polyline using max pooling
+        # [batch_size, num_vectors, num_features * (2**num_subgraph_layers)] ->
+        # [batch_size, num_features * (2**num_subgraph_layers)]
+        assert polyline_features.shape == (batch_size, num_vectors, self.num_features * (2**self.num_subgraph_layers))
+        # [batch_size, num_vectors, num_features * (2**num_subgraph_layers)] ->
+        # [batch_size, num_features * (2**num_subgraph_layers), num_vectors]
+        y = polyline_features.permute(0, 2, 1)
+        # [batch_size, num_features * (2**num_subgraph_layers), num_vectors] ->
+        # [batch_size, num_features * (2**num_subgraph_layers)]
+        y_max = F.max_pool1d(y, kernel_size=num_vectors)
+        # [batch_size, num_features * (2**num_subgraph_layers)] ->
+        # [batch_size, num_features * (2**num_subgraph_layers)]
+        polyline_features = y_max.squeeze(2)
+        assert polyline_features.shape == (batch_size, self.num_features * (2**self.num_subgraph_layers))
+
         return polyline_features
 
 
@@ -209,7 +278,7 @@ class PolylineSubGraphLayer(nn.Module):
             nn.Linear(input_dim * 2, input_dim * 2)
         )
 
-    def forward(self, x: torch.Tensor):
+    def forward(self, x: torch.Tensor)->torch.Tensor:
         """
         Forward the inputs of PolylineSubGraphLayer and output the features of each vector.
 
@@ -238,32 +307,52 @@ class PolylineSubGraphLayer(nn.Module):
         return x
 
 class GlobalGraph(nn.Module):
-    def __init__(self, input_dim: int, hidden_dim: int) -> None:
+    def __init__(self, 
+        num_global_layers: int,
+        num_global_heads: int,
+        emb_dim: int,
+    ) -> None:
+        """
+        Instantiate the GlobalGraph.
+
+        Args:
+            num_global_layers: number of layers for the global graph.
+            num_global_heads: number of attention heads for the global graph.
+            emb_dim: dimension of the input features.
+        """
         super().__init__()
-        self.attention = nn.MultiheadAttention(input_dim, num_heads=8)
-        self.processor = nn.Sequential(
-            nn.Linear(input_dim, hidden_dim),
-            nn.ReLU(),
-            nn.Linear(hidden_dim, hidden_dim)
-        )
+        # self.attention = nn.MultiheadAttention(num_global_layers, num_global_heads)
+        for _ in range(num_global_layers):
+            self.attention = nn.MultiheadAttention(embed_dim=emb_dim, num_heads=num_global_heads)
+            self.decoder = nn.Sequential(
+                nn.Linear(emb_dim, emb_dim),
+                nn.ReLU(),
+                nn.Linear(emb_dim, emb_dim)
+            )
         
-    def forward(self, polyline_features: torch.Tensor) -> torch.Tensor:
+    def forward(self, 
+        polyline_features: torch.Tensor,
+        target_index: torch.Tensor,
+    ) -> torch.Tensor:
         """Process polyline features through global attention and MLP layers.
         
         Args:
-            polyline_features (torch.Tensor): Input tensor containing polyline features
-                Shape: [batch_size, num_polylines, hidden_dim]
+            polyline_features: Polyline features after the subgraph.
+                [batch_size, num_polylines, num_global_graph_input_output_dim]
+                NOTE: num_global_graph_input_output_dim = num_features * (2**num_subgraph_layers)
+
+            target_index: Index of the target agent to be predicted, mapping to the batch index.
+                [batch_size]
+                (ex) target_index = [0, 1, 2, 3, 4, 5, 6, 7, 8, 9,...15] if batch_size = 16. 
+                Since VectorNet could only predict trajectory of one agent at a time,
+                we need to specify the index of the target agent to be predicted.
+                This index is used to select the correct output from the VectorNet.
                 
         Returns:
-            torch.Tensor: Processed global features after attention and MLP
-                Shape: [batch_size, num_polylines, hidden_dim]
+            global_features: Processed global features after attention.
+                [batch_size, num_global_graph_input_output_dim]
         """
-        # polyline_features: [batch_size, num_polylines, hidden_dim]
-        
-        # Reshape for attention
-        batch_size, num_polylines, hidden_dim = polyline_features.shape
-        polyline_features = polyline_features.reshape(batch_size * num_polylines, 1, hidden_dim)
-        
+        batch_size, num_polylines, emb_dim = polyline_features.shape
         # Apply attention
         attended_features, _ = self.attention(polyline_features, polyline_features, polyline_features)
         
@@ -273,3 +362,12 @@ class GlobalGraph(nn.Module):
         
         return global_features
 
+class GlobalGraphLayer(nn.Module):
+    def __init__(self, emb_dim: int) -> None:
+        super().__init__()
+        self.attention = nn.MultiheadAttention(embed_dim=emb_dim, num_heads=num_global_heads)
+        self.decoder = nn.Sequential(
+            nn.Linear(emb_dim, emb_dim),
+            nn.ReLU(),
+            nn.Linear(emb_dim, emb_dim)
+        )
