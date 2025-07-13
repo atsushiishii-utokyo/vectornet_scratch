@@ -16,103 +16,186 @@ VectorNet is a neural network architecture designed for trajectory prediction in
 ## Model Architecture
 
 1. **Input:**  
-   - A batch of polylines, where each polyline is a sequence of vectors (e.g., positions, attributes).
-   - Masks indicating valid vectors within each polyline.
+   - A list of polylines, where each polyline is a sequence of vectors (e.g., positions, attributes).
+   - Target agent index for batch processing.
+   - Optional masks indicating valid vectors within each polyline.
 
 2. **PolylineSubGraph:**  
-   - Encodes each polyline independently using MLPs and feature aggregation.
+   - Encodes each polyline independently using multiple layers of MLPs and feature aggregation.
+   - Processes polylines in target agent-centric coordinates.
 
 3. **GlobalGraph:**  
-   - Applies attention or message passing across all polyline features to model their interactions.
+   - Applies multi-head attention across all polyline features to model their interactions.
+   - Uses target agent index to select relevant features for prediction.
 
-4. **Decoder:**  
-   - Maps the global features to the desired output, such as future positions of the target agent.
+4. **Trajectory Decoder:**  
+   - Maps the global features to future trajectory predictions using an MLP.
+
+## Configuration
+
+The model uses a configuration system defined in `network/config.py`:
+
+```python
+VECTORNET_CONFIG = {
+    "num_subgraph_layers": 3,        # Number of polyline subgraph layers
+    "num_global_layers": 1,          # Number of global graph layers
+    "num_global_heads": 3,           # Number of attention heads
+    "num_features": 6,               # Vector feature dimension (ds_x,ds_y,de_x,de_y,a,j)
+    "num_future_steps": 30,          # Number of future timesteps to predict
+    "num_prediction_features": 2,    # Output features (x,y coordinates)
+    "num_past_steps": 60,            # Number of past timesteps
+    "num_vectors": 60,               # Number of vectors per polyline
+}
+```
 
 ## Usage
 
-The main model is implemented in `network/vectornet.py` as the `VectorNet` class. It can be instantiated and used as follows:
+### VectorNet_prediction (Recommended)
+
+The main prediction model that combines VectorNet with trajectory decoding:
 
 ```python
-model = VectorNet(input_dim=2, hidden_dim=64, output_dim=2)
+from network.vectornet import VectorNet_prediction
+from network.config import VECTORNET_CONFIG
+
+# Create model
+model = VectorNet_prediction(VECTORNET_CONFIG)
 
 # Example input
+batch_size = 16
+num_polylines = 10
+num_vectors = 60
+num_features = 6
 
-polylines = torch.randn(batch_size, num_polylines, num_vectors, input_dim)
-masks = torch.ones_like(polylines)
+# Create polylines list
+polylines_list = [
+    torch.randn(num_vectors, num_features) for _ in range(num_polylines)
+]
+
+# Target agent indices
+target_index = torch.arange(batch_size)
 
 # Forward pass
+predictions = model(polylines_list, target_index)
+# Output shape: [batch_size, num_future_steps, num_prediction_features]
+```
 
-predictions = model(polylines, masks)
+### VectorNet (Core Architecture)
+
+The core VectorNet architecture without trajectory decoding:
+
+```python
+from network.vectornet import VectorNet
+
+# Create model
+vectornet = VectorNet(
+    num_vectors=60,
+    num_features=6,
+    num_subgraph_layers=3,
+    num_global_layers=1,
+    num_global_heads=3
+)
+
+# Forward pass
+global_features = vectornet(polylines_list, target_index)
+# Output shape: [batch_size, global_graph_input_output_dim]
 ```
 
 ## Additional Components
 
 ### MLP Layer
 
-The `MLP` class in `network/mlp.py` implements a simple Multi-Layer Perceptron with layer normalization and ReLU activation functions. It is used in the `PolylineSubGraphLayer` and `GlobalGraph` modules.
+The `MLP` class in `network/mlp.py` implements a Multi-Layer Perceptron with layer normalization and ReLU activation functions:
 
 ```python
+from network.mlp import MLP
+
 mlp = MLP(input_size=128, output_size=64, hidden_size=128)
 
 # Example usage
-
 x = torch.randn(10, 128)
 output = mlp(x)
 ```
 
-### PolylineSubGraphLayer
+### PolylineSubGraph
 
-The `PolylineSubGraphLayer` class in `network/vectornet.py` implements the local graph processing for each polyline. It uses an MLP to encode the polyline features and a permutation-based aggregation mechanism to capture the spatial relationships within the polyline.
+The `PolylineSubGraph` class processes each polyline independently through multiple layers:
 
 ```python
+from network.vectornet import PolylineSubGraph
 
-    polyline_subgraph = PolylineSubGraphLayer(input_dim=2, hidden_dim=64)
+polyline_subgraph = PolylineSubGraph(
+    num_subgraph_layers=3,
+    num_features=6
+)
 
-    # Example usage
-
-    polylines = torch.randn(batch_size, num_polylines, num_vectors, input_dim)
-    masks = torch.ones_like(polylines)
-
-    local_features = polyline_subgraph(polylines, masks)
+# Example usage
+polyline = torch.randn(batch_size, num_vectors, num_features)
+local_features = polyline_subgraph(polyline)
 ```
 
 ### GlobalGraph
 
-The `GlobalGraph` class in `network/vectornet.py` implements the global graph processing for all polylines. It uses an MLP to encode the polyline features and a permutation-based aggregation mechanism to capture the spatial relationships within the polyline.
+The `GlobalGraph` class implements multi-head attention across all polylines:
 
 ```python
+from network.vectornet import GlobalGraph
 
-global_graph = GlobalGraph(input_dim=64, hidden_dim=128)
-
-# Example usage
-
-global_features = global_graph(local_features)
-```                     
-
-## Decoder
-
-The `Decoder` class in `network/vectornet.py` implements the decoder for the VectorNet model. It uses an MLP to decode the global features to the desired output, such as future positions of the target agent.
-
-```python
-decoder = Decoder(input_dim=128, hidden_dim=64, output_dim=2)
+global_graph = GlobalGraph(
+    num_global_layers=1,
+    num_global_heads=3,
+    emb_dim=48  # num_features * (2**num_subgraph_layers)
+)
 
 # Example usage
-
-predictions = decoder(global_features)
+polyline_features = torch.randn(batch_size, num_polylines, emb_dim)
+global_features = global_graph(polyline_features, target_index)
 ```
 
-## Training
+## Testing
 
-The model can be trained using the `train.py` script.
+Run unit tests to verify the implementation:
 
 ```bash
-python train.py
-``` 
+python unit_tests.py
+```
 
-## Evaluation
+The tests cover:
+- MLP output shape and type validation
+- Gradient computation
+- Forward pass consistency
 
-The model can be evaluated using the `evaluate.py` script.
+## Development
 
-```bash 
-python evaluate.py
-``` 
+### Jupyter Notebook
+
+A Jupyter notebook (`vectornet.ipynb`) is provided for interactive development and experimentation.
+
+### Main Entry Point
+
+The `main.py` file serves as the entry point for the application.
+
+## Key Features
+
+- **Target Agent-Centric Processing**: Automatically converts polylines to target agent-centric coordinates
+- **Batch Processing**: Supports predicting trajectories for multiple agents simultaneously
+- **Configurable Architecture**: Easy to modify network parameters through configuration
+- **Modular Design**: Clean separation between polyline processing, global attention, and trajectory decoding
+- **Type Hints**: Full type annotations for better code maintainability
+
+## Architecture Details
+
+### Input Processing
+- Polylines are represented as sequences of 6-dimensional vectors (ds_x, ds_y, de_x, de_y, a, j)
+- Each polyline is processed independently through the subgraph layers
+- Features are aggregated using permutation-invariant operations
+
+### Global Attention
+- Multi-head attention mechanism captures interactions between all polylines
+- Target agent index is used to select relevant features for prediction
+- Supports both self-attention and cross-attention patterns
+
+### Output Generation
+- Trajectory decoder maps global features to future positions
+- Configurable number of future timesteps and prediction features
+- Output format: [batch_size, num_future_steps, num_prediction_features] 
