@@ -11,13 +11,15 @@ class VectorNet_prediction(nn.Module):
     
     MLP is used to decode the output of the VectorNet to the prediction output.
     [batch_size, num_features * (2**num_subgraph_layers)] -> 
-    [batch_size, num_prediction_features * num_future_steps]
+    [batch_size, num_future_steps, num_prediction_features]
 
     Args:
         config: Configuration for the VectorNet.
     """
     def __init__(self, config: dict[str, int]) -> None:
         super().__init__()
+        self.num_future_steps = config["num_future_steps"]
+        self.num_prediction_features = config["num_prediction_features"]
         self.vectornet = VectorNet(
             num_vectors=config["num_vectors"],
             num_features=config["num_features"],
@@ -26,8 +28,8 @@ class VectorNet_prediction(nn.Module):
             num_global_heads=config["num_global_heads"],
         )
         self.traj_decoder = MLP(
-            input_size=self.vectornet.graph_output_dim,
-            output_size=config["num_prediction_features"]*config["num_future_steps"]
+            input_size=self.vectornet.global_graph_input_output_dim,
+            output_size=self.num_future_steps*self.num_prediction_features
         )
     def forward(self, 
         polylines_list: list[torch.Tensor],
@@ -51,18 +53,21 @@ class VectorNet_prediction(nn.Module):
                 Batch processing allows us to predict trajectories of multiple agents at once.
                 However, the inputs of Polylines should be converted to the target agent centric coordinates.
                 This is done by subtracting the position of the target agent from the position of the other agents.
-                This is done by the following code:
+                with the following code:
                 polylines_list = [polylines - polylines[target_index]]
 
                 TODO: Implement the code to convert the polylines to the target agent centric coordinates.
 
         Returns:
-            output (torch.Tensor): Trajectory Prediction
+            output: Trajectory Prediction for each given track id
+                [batch_size, num_future_steps, num_prediction_features]
         """
         # [[num_vectors, num_features] * num_polylines] -> [batch_size, graph_output_dim]
         output = self.vectornet(polylines_list, target_index)
         # [batch_size, graph_output_dim] -> [batch_size, num_prediction_features * num_future_steps]
         output = self.traj_decoder(output)
+        # reshape the output
+        output = output.view(-1, self.num_future_steps, self.num_prediction_features)
 
         return output
 
@@ -272,11 +277,6 @@ class PolylineSubGraphLayer(nn.Module):
         self.input_dim = input_dim
         self.node_encoder = MLP(input_dim, input_dim)
         self.edge_encoder = nn.Linear(input_dim * 2, input_dim * 2)
-        self.node_processor = nn.Sequential(
-            nn.Linear(input_dim * 2, input_dim * 2),
-            nn.ReLU(),
-            nn.Linear(input_dim * 2, input_dim * 2)
-        )
 
     def forward(self, x: torch.Tensor)->torch.Tensor:
         """
@@ -302,8 +302,7 @@ class PolylineSubGraphLayer(nn.Module):
         x = torch.cat([x, x.max(dim=1)[0].unsqueeze(1)], dim=-1)
         # [batch_size, num_vectors, input_dim*2] -> [batch_size, num_vectors, input_dim*2]
         x = self.edge_encoder(x)
-        # [batch_size, num_vectors, input_dim*2] -> [batch_size, num_vectors, input_dim*2]
-        x = self.node_processor(x)
+
         return x
 
 class GlobalGraph(nn.Module):
@@ -321,25 +320,25 @@ class GlobalGraph(nn.Module):
             emb_dim: dimension of the input features.
         """
         super().__init__()
-        # self.attention = nn.MultiheadAttention(num_global_layers, num_global_heads)
-        for _ in range(num_global_layers):
-            self.attention = nn.MultiheadAttention(embed_dim=emb_dim, num_heads=num_global_heads)
-            self.decoder = nn.Sequential(
-                nn.Linear(emb_dim, emb_dim),
-                nn.ReLU(),
-                nn.Linear(emb_dim, emb_dim)
-            )
+        self.emb_dim = emb_dim
+        self.num_global_heads = num_global_heads
+        # Ensure  embed_dimis divisible by num_heads
+        assert emb_dim % num_global_heads == 0
+        self.global_graph = nn.ModuleList([
+            GlobalGraphLayer(embed_dim=emb_dim, num_heads=num_global_heads) for i in range(num_global_layers)
+        ])
         
     def forward(self, 
         polyline_features: torch.Tensor,
         target_index: torch.Tensor,
     ) -> torch.Tensor:
-        """Process polyline features through global attention and MLP layers.
+        """Process polyline features through global attention 
+        interacting different nodes (=tokens)
         
         Args:
             polyline_features: Polyline features after the subgraph.
-                [batch_size, num_polylines, num_global_graph_input_output_dim]
-                NOTE: num_global_graph_input_output_dim = num_features * (2**num_subgraph_layers)
+                [batch_size, num_polylines, emb_dim]
+                NOTE: emb_dim = num_global_graph_input_output_dim = num_features * (2**num_subgraph_layers)
 
             target_index: Index of the target agent to be predicted, mapping to the batch index.
                 [batch_size]
@@ -349,25 +348,50 @@ class GlobalGraph(nn.Module):
                 This index is used to select the correct output from the VectorNet.
                 
         Returns:
-            global_features: Processed global features after attention.
-                [batch_size, num_global_graph_input_output_dim]
+            output_node: Processed global features after attention for each track id.
+                [batch_size, emb_dim]
         """
-        batch_size, num_polylines, emb_dim = polyline_features.shape
-        # Apply attention
-        attended_features, _ = self.attention(polyline_features, polyline_features, polyline_features)
-        
-        # Process through MLP
-        attended_features = attended_features.reshape(batch_size, num_polylines, hidden_dim)
-        global_features = self.processor(attended_features)
-        
-        return global_features
+        assert self.emb_dim == polyline_features.shape[3]
+        for global_graph_layer in self.global_graph:
+            # [batch_size, num_polylines, emb_dim]
+            polyline_features = global_graph_layer(polyline_features)
+        # Specify the target index if feature.
+        assert target_index.shape[0] == polyline_features.shape[0]
+        output_node = polyline_features[:, target_index, :]
+
+        return output_node
 
 class GlobalGraphLayer(nn.Module):
-    def __init__(self, emb_dim: int) -> None:
+    def __init__(self, embed_dim: int, num_heads: int) -> None:
+        """Processing global multi heaf attentionp
+        """
         super().__init__()
-        self.attention = nn.MultiheadAttention(embed_dim=emb_dim, num_heads=num_global_heads)
-        self.decoder = nn.Sequential(
-            nn.Linear(emb_dim, emb_dim),
-            nn.ReLU(),
-            nn.Linear(emb_dim, emb_dim)
-        )
+        self.W_key = nn.Linear(embed_dim, embed_dim)
+        self.W_query = nn.Linear(embed_dim, embed_dim)
+        self.W_value = nn.Linear(embed_dim, embed_dim)
+        self.attention = nn.MultiheadAttention(embed_dim=embed_dim, num_heads=num_heads)
+
+    def forward(self, polyline_features: torch.Tensor):
+        """
+        Process the global graph attention
+        
+        Args:
+            polyline_features: polyline features with the shape of
+                [batch_size, num_polylines, emb_dim]
+        Returns:
+            output
+                [batch_size, num_polylines, emb_dim]
+        """
+        # 1. Generate key, query, and value
+        # [batch_size, num_polylines, emb_dim]
+        key = self.W_key(polyline_features)
+        query = self.W_query(polyline_features)
+        value = self.W_value(polyline_features)
+        # 2. Process global attention
+        output, _ = self.attention(query, key, value)
+
+        return output
+
+
+
+
