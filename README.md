@@ -199,3 +199,6 @@ The `main.py` file serves as the entry point for the application.
 - Trajectory decoder maps global features to future positions
 - Configurable number of future timesteps and prediction features
 - Output format: [batch_size, num_future_steps, num_prediction_features] 
+
+### When in Paris
+- Update A.DHD factor to level 5
